@@ -9,6 +9,8 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "../src/llama-impl.h"
+#include "../src/llama-memory-hybrid.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -683,6 +685,9 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // true if the model uses hybrid architecture (attention + recurrent/SSM layers)
+    bool is_hybrid;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -864,6 +869,8 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
+
+        is_hybrid = llama_model_is_hybrid(model);
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -1180,7 +1187,7 @@ private:
                     ret->prompt_clear(false);
                 }
 
-                prompt_cache->update();
+                prompt_cache->update(&task.tokens);
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2364,6 +2371,23 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // debug: log divergence point for cache analysis
+                                if (n_past < (int)input_tokens.size() && n_past < (int)slot.prompt.tokens.size()) {
+                                    SLT_WRN(slot, "cache prefix divergence at token %d: slot_token=%d input_token=%d\n",
+                                        n_past, slot.prompt.tokens[n_past], input_tokens[n_past]);
+                                    // Decode context: print 5 tokens before and after divergence
+                                    const int ctx_start = std::max(0, n_past - 5);
+                                    const int ctx_end = std::min(n_past + 5, (int)std::min(slot.prompt.tokens.size(), input_tokens.size()));
+                                    std::string slot_ctx, input_ctx;
+                                    for (int i = ctx_start; i < ctx_end; i++) {
+                                        if (i > ctx_start) { slot_ctx += " "; input_ctx += " "; }
+                                        slot_ctx += common_token_to_piece(ctx, slot.prompt.tokens[i]);
+                                        input_ctx += common_token_to_piece(ctx, input_tokens[i]);
+                                    }
+                                    SLT_WRN(slot, "  slot context:  ...%s...\n", slot_ctx.c_str());
+                                    SLT_WRN(slot, "  input context: ...%s...\n", input_ctx.c_str());
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -2490,13 +2514,39 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                    if (is_hybrid) {
+                                        SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, is_hybrid = true (recurrent memory)\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                        // For hybrid models, we want a checkpoint that covers at least n_past tokens
+                                        // but no more than task.n_tokens. This preserves common prefix caching
+                                        // without overshooting what the new task needs.
+                                        // If no checkpoint exists in this range, we'll fall back to the smallest
+                                        // checkpoint that covers n_past (and handle the overflow case later).
+                                        const auto target_n_tokens = std::min((int64_t) slot.task->n_tokens(), (int64_t) INT32_MAX);
+                                        (void) target_n_tokens; // will use below
+                                    } else {
+                                        SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                    }
 
                                     // search for a context checkpoint
+                                    // for hybrid models, recurrent state covers all positions so we match
+                                    // on n_tokens rather than pos_min/pos_max
+                                    const int64_t task_n_tokens = (slot).task ? (slot).task->n_tokens() : INT32_MAX;
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&, func_name = __func__](const auto & cur) {
+                                            if (is_hybrid) {
+                                                // For hybrid models: find a checkpoint where n_tokens >= n_past AND
+                                                // n_tokens < task_n_tokens. This ensures at least 1 new token is
+                                                // processed for logits extraction. Checkpoints larger than the task
+                                                // cause n_past > task.n_tokens which results in "no tokens to decode".
+                                                const int64_t task_tokens = task_n_tokens;
+                                                LOG_INF("slot %12.*s: id %2d | task %d | Checking hybrid checkpoint [n_tokens=%" PRId64 "] against n_past=%d, task.n_tokens=%d...\n", 12,
+                                                    func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.n_tokens, n_past, (int) task_tokens);
+                                                
+                                                return (int64_t) cur.n_tokens >= n_past && (int64_t) cur.n_tokens < task_tokens;
+                                            }
+
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
@@ -2505,6 +2555,8 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    bool checkpoint_restored = false;
+                                    (void) checkpoint_restored; // may be used by future checkpoint handling
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -2516,26 +2568,65 @@ private:
                                             do_reset = true;
                                             //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                                         } else {
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            // For hybrid models, the checkpoint's recurrent state covers all
+                                            // positions. The pos_min/pos_max values are meaningless for
+                                            // recurrent layers - only n_tokens matters.
+                                            if (is_hybrid) {
+                                                n_past = std::min((int)slot.prompt.tokens.size(), (int)it->n_tokens);
+                                                pos_next = n_past;
+                                                checkpoint_restored = true;
+                                            } else {
+                                                pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                                n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                                checkpoint_restored = true;
+                                            }
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                         }
-                                    }
+                                   }
 
-                                    if (do_reset) {
-                                        SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
-                                    }
-                                }
-                            }
+                                   if (do_reset) {
+                                       SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                               "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                       pos_next = 0;
+                                       n_past = 0;
+                                       checkpoint_restored = false;
+                                   }
+
+                                   if (!do_reset || is_hybrid) {
+                                       // for hybrid models, always clear truncated flag after checkpoint handling
+                                       // even on reset, as the context will be rebuilt from scratch
+                                       slot.truncated = false;
+                                   }
+
+                                   if (!do_reset) {
+                                       // for hybrid models with checkpoint restore, mark as truncated
+                                       // so the next request knows prompt was partially cached
+                                       slot.truncated = true;
+                                  }
+
+                               }
+                           }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // erase any checkpoints that are now invalid:
+                                // - for all models: checkpoints with pos_max > pos_next
+                                // - for hybrid models with an actual checkpoint restore: checkpoints
+                                //   with n_tokens > pos_next (these have recurrent state extending
+                                //   beyond what the restored checkpoint covers)
+                                //
+                                // NOTE: do NOT erase checkpoints when pos_next == 0 (reset case).
+                                // The checkpoints may still be useful for future requests even if
+                                // they can't be used for the current divergent prompt.
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    bool should_erase = cur.pos_max > pos_next;
+                                    // Only apply hybrid erasure if we actually restored a checkpoint
+                                    // (pos_next > 0). On reset (pos_next = 0), keep all checkpoints.
+                                    if (is_hybrid && pos_next > 0 && cur.n_tokens > pos_next) {
+                                        should_erase = true;
+                                    }
+
+                                    if (should_erase) {
                                         SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
@@ -2546,10 +2637,12 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                        // when n_past >= task.n_tokens, we need to evaluate at least 1 token
+                        // for proper logits extraction. Decrement to ensure the last token is processed.
+                        if (n_past >= (int) slot.task->n_tokens() && n_past > 0) {
+                            SLT_WRN(slot, "n_past >= task.n_tokens, need to evaluate at least 1 token (n_past = %d, task.n_tokens = %d)\n", n_past, (int) slot.task->n_tokens());
                             n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            SLT_WRN(slot, "n_past adjusted to %d for processing\n", n_past);
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
@@ -2574,15 +2667,28 @@ private:
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
-                    SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                    // For hybrid models with a successfully restored checkpoint (p0 > 0), we need
+                    // to clear orphaned KV entries from the prompt_load that extend beyond p0.
+                    // Full seq_rm fails for hybrid models because it also tries to clear recurrent
+                    // state, but seq_rm_attn_only clears just the attention KV entries.
+                    // When do_reset = true (p0 == 0), we MUST clear the entire KV cache because
+                    // it may contain stale entries from a previous slot usage at higher positions.
+                    if (is_hybrid && p0 > 0) {
+                        // Clear attention-only KV entries beyond p0 to free space for new tokens.
+                        // This removes orphaned entries from the prompt_load that extend past
+                        // the checkpoint's coverage, without disturbing the recurrent state.
+                        SLT_INF(slot, "n_tokens = %d, memory_seq_rm_attn_only [%d, end) for hybrid checkpoint cleanup\n", slot.prompt.n_tokens(), p0);
+                        llama_memory_seq_rm_attn_only(llama_get_memory(ctx), slot.id, p0, -1);
+                    } else {
+                        SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
-                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                            SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
-                        slot.prompt_clear(true);
-
-                        // there is no common part left
-                        slot.n_prompt_tokens_cache = 0;
+                            llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
+                            slot.n_prompt_tokens_cache = 0;
+                            slot.prompt.tokens.clear();
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -2607,10 +2713,11 @@ private:
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
-                    // - the model uses SWA (and we are not using `swa_full`)
+                    // - the model uses SWA (and we are not using `swa_full`) or is a hybrid model
                     do_checkpoint = do_checkpoint && (
                             (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
-                            (n_swa > 0));
+                            (n_swa > 0) ||
+                            is_hybrid);
 
                     bool has_mtmd = false;
 
@@ -2825,7 +2932,15 @@ private:
                     // TODO: handle ret == 2 (abort) when we start aborting
 
                     if (!err.empty()) {
-                        SRV_ERR("%s i = %d, n_batch = %d, ret = %d\n", err.c_str(), i, n_batch, ret);
+                        // log KV cache state for diagnostics
+                        for (auto & slot : slots) {
+                            if (slot.is_processing()) {
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+                                SRV_ERR("%s i = %d, n_batch = %d, ret = %d, slot %d: n_past = %d, prompt_tokens = %d, task_tokens = %d, pos_min = %d, pos_max = %d, n_ctx = %d\n",
+                                    err.c_str(), i, n_batch, ret, slot.id, slot.n_prompt_tokens_cache, (int)slot.prompt.tokens.size(), (int)slot.task->n_tokens(), pos_min, pos_max, slot.n_ctx);
+                            }
+                        }
 
                         for (auto & slot : slots) {
                             if (slot.is_processing()) {
@@ -2842,9 +2957,37 @@ private:
                     }
                 }
 
-                // retry with half the batch size to try to find a free slot in the KV cache
-                if (!try_clear_idle_slots()) {
-                    n_batch /= 2;
+                // When ret == 1 (KV full), shrinking batch size doesn't help - we need to free KV cells.
+                // When ret == -1 (invalid batch), shrinking might help with alignment issues.
+                if (ret == 1) {
+                    // KV cache is full - try to free space
+                    bool freed = false;
+
+                    // First: clear idle slots
+                    freed = try_clear_idle_slots();
+
+                    // Second: evict prompt cache entries (they may hold KV references)
+                    if (!freed && prompt_cache) {
+                        SRV_WRN("%s", "attempting cache eviction to free KV space\n");
+                        freed = prompt_cache->evict();
+                    }
+
+                    if (freed) {
+                        // restore batch size and retry
+                        n_batch = llama_n_batch(ctx);
+                        SRV_WRN("freed KV space, retrying with n_batch = %d, i = %d\n", n_batch, i);
+                    } else {
+                        // No way to free space - this is a fatal error for the current task
+                        // Don't loop endlessly with shrinking batch sizes
+                        SRV_ERR("cannot free KV space after exhausting all eviction options, i = %d\n", i);
+                        // Fall through to the error handler below which will abort the task
+                        n_batch = 1; // force error on next iteration
+                    }
+                } else {
+                    // For other errors (ret == -1), shrinking batch size might help
+                    if (!try_clear_idle_slots()) {
+                        n_batch /= 2;
+                    }
                 }
 
                 SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
