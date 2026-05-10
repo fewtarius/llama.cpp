@@ -615,7 +615,11 @@ extern "C" {
     // Returns true if the model is recurrent (like Mamba, RWKV, etc.)
     LLAMA_API bool llama_model_is_recurrent(const struct llama_model * model);
 
-    // Returns true if the model is hybrid (like Jamba, Granite, etc.)
+
+    // Returns true if the model uses multi-head latent attention (MLA) with compressed KV cache
+    LLAMA_API bool llama_model_is_mla(const struct llama_model * model);
+
+   // Returns true if the model is hybrid (like Jamba, Granite, etc.)
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)

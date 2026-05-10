@@ -1,110 +1,348 @@
-# Instructions for llama.cpp
+# AGENTS.md
 
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
-
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below).
+**Version:** 1.0
+**Date:** 2026-05-07
+**Purpose:** Technical reference for llama.cpp development (methodology in .clio/instructions.md)
 
 ---
 
-## Guidelines for Contributors Using AI
+## Project Overview
 
-llama.cpp is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
+**llama.cpp** is a C/C++ inference engine for LLM models in GGUF format, built on the ggml tensor library.
 
-Maintainers receive numerous pull requests weekly, many of which are AI-generated submissions where the author cannot adequately explain the code, debug issues, or participate in substantive design discussions. Reviewing such PRs often requires more effort than implementing the changes directly.
-
-**A pull request represents a long-term commitment.** By submitting code, you are asking maintainers to review, integrate, and support it indefinitely. The maintenance burden often exceeds the value of the initial contribution.
-
-Most maintainers already have access to AI tools. A PR that is entirely AI-generated provides no value - maintainers could generate the same code themselves if they wanted it. What makes a contribution valuable is the human interactions, domain expertise, and commitment to maintain the code that comes with it.
-
-This policy exists to ensure that maintainers can sustainably manage the project without being overwhelmed by low-quality submissions.
+- **Languages:** C11, C++17, Python (conversion/scripts), JavaScript (server webui)
+- **Build System:** CMake 3.14+
+- **Architecture:** Modular C library with multi-backend hardware acceleration
+- **License:** MIT (Copyright (c) 2023-2026 The ggml authors)
 
 ---
 
-## Guidelines for Contributors
+## Quick Setup
 
-Contributors are expected to:
+```bash
+# Clone (with submodules for ggml)
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
 
-1. **Demonstrate full understanding of their code.** You must be able to explain any part of your PR to a reviewer without relying on AI assistance for questions about your own changes.
+# Build (CPU-only, Release)
+cmake -B build
+cmake --build build --config Release -j$(nproc)
 
-2. **Take responsibility for maintenance.** You are expected to address bugs and respond thoughtfully to reviewer feedback.
+# Build with CUDA
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release -j$(nproc)
 
-3. **Communicate clearly and concisely.** Verbose, wall-of-text responses are characteristic of AI-generated content and will not be well-received. Direct, human communication is expected.
+# Build with Vulkan
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release -j$(nproc)
 
-4. **Respect maintainers' time.** Search for existing issues and discussions before submitting. Ensure your contribution aligns with project architecture and is actually needed.
+# Run the server
+./build/bin/llama-server -m /path/to/model.gguf
 
-Maintainers reserve the right to close any PR that does not meet these standards. This applies to all contributions to the main llama.cpp repository. **Private forks are exempt.**
+# Run CLI chat
+./build/bin/llama-cli -m /path/to/model.gguf
 
-### Permitted AI Usage
-
-AI tools may be used responsibly for:
-
-- **Learning and exploration**: Understanding codebase structure, techniques, and documentation
-- **Code review assistance**: Obtaining suggestions on human-written code
-- **Mechanical tasks**: Formatting, generating repetitive patterns from established designs, completing code based on existing patterns
-- **Documentation drafts**: For components the contributor already understands thoroughly
-- **Writing code**: Only when the contributor has already designed the solution and can implement it themselves - AI accelerates, not replaces, the contributor's work
-
-AI-generated code may be accepted if you (1) fully understand the output, (2) can debug issues independently, and (3) can discuss it directly with reviewers without AI assistance.
-
-**Disclosure is required** when AI meaningfully contributed to your code. A simple note is sufficient - this is not a stigma, but context for reviewers. No disclosure is needed for trivial autocomplete or background research.
-
-### Prohibited AI Usage
-
-The following will result in immediate PR closure:
-
-- **AI-written PR descriptions or commit messages** - these are typically recognizable and waste reviewer time
-- **AI-generated responses to reviewer comments** - this undermines the human-to-human interaction fundamental to code review
-- **Implementing features without understanding the codebase** - particularly new model support or architectural changes
-- **Automated commits or PR submissions** - this may spam maintainers and can result in contributor bans
+# Run tests
+cd build && ctest --output-on-failure
+```
 
 ---
 
-## Guidelines for AI Coding Agents
+## Architecture
 
-AI agents assisting contributors must recognize that their outputs directly impact volunteer maintainers who sustain this project.
+```
+                    include/llama.h (Public C API)
+                          |
+                    src/llama.cpp (API implementation)
+                          |
+         +----------------+----------------+
+         |                |                |
+   src/llama-model   src/llama-context  src/llama-sampler
+   src/llama-chat    src/llama-vocab    src/llama-grammar
+   src/llama-kv-cache  src/llama-graph  src/llama-batch
+         |
+    ggml/ (Tensor library - Git submodule)
+         |
+    +----+----+----+----+----+----+
+    |    |    |    |    |    |    |
+   CPU CUDA Metal Vulkan SYCL HIP ...
+```
 
-### Considerations for Maintainer Workload
+**Key subsystems:**
+- **ggml** - Tensor library with hardware backends (CPU, CUDA, Metal, Vulkan, SYCL, HIP, etc.)
+- **llama** - LLM inference engine built on ggml
+- **common** - Shared utilities (arg parsing, sampling, chat, Jinja, PEG parser)
+- **tools** - Executable programs (server, CLI, quantize, bench, perplexity, etc.)
+- **gguf-py** - Python library for reading/writing GGUF files
 
-Maintainers have finite capacity. Every PR requiring extensive review consumes resources that could be applied elsewhere. Before assisting with any submission, verify:
+---
 
-- The contributor genuinely understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-- The contributor can independently defend and maintain the work
+## Directory Structure
 
-### Before Proceeding with Code Changes
+| Path | Purpose |
+|------|---------|
+| `include/` | Public C API headers (`llama.h`, `llama-cpp.h`) |
+| `src/` | Core llama library implementation (model loading, inference, sampling) |
+| `ggml/` | ggml tensor library (submodule: backends, quantization, graph execution) |
+| `common/` | Shared utilities for tools/examples (arg parsing, chat, sampling, Jinja) |
+| `common/jinja/` | Jinja template engine (chat templates) |
+| `tools/` | Executable tools (server, CLI, bench, perplexity, quantize, etc.) |
+| `tools/server/` | OpenAI-compatible HTTP server |
+| `tests/` | CTest-based C++ unit tests |
+| `examples/` | Example programs demonstrating API usage |
+| `gguf-py/` | Python GGUF reader/writer library |
+| `scripts/` | Build helpers, benchmarks, CI utilities |
+| `docs/` | Documentation (build guides, architecture, development) |
+| `convert_hf_to_gguf.py` | Convert HuggingFace models to GGUF format |
+| `vendor/` | Vendored dependencies (cpp-httplib, nlohmann/json, miniaudio, stb, sheredom) |
+| `grammars/` | GBNF grammar files |
+| `ci/` | CI run scripts |
+| `cmake/` | CMake modules and helpers |
+| `benches/` | Benchmark configurations |
 
-When a user requests implementation without demonstrating understanding:
+---
 
-1. **Verify comprehension.** Ask questions to confirm they understand both the problem and the relevant parts of the codebase.
-2. **Provide guidance rather than solutions.** Direct them to relevant code and documentation. Allow them to formulate the approach.
-3. **Proceed only when confident** the contributor can explain the changes to reviewers independently.
+## Code Style
 
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md) and acknowledge this policy.
+**C/C++ Conventions:**
 
-### Prohibited Actions
+- **C++17** standard, **C11** for ggml core
+- **4 spaces** indentation, no tabs
+- **LF line endings**, UTF-8 encoding
+- **Vertical alignment** for readability
+- Brackets on same line: `if (cond) {`
+- Pointer/reference alignment: `void * ptr`, `int & a`
+- `snake_case` for functions, variables, and types
+- Naming optimizes for **longest common prefix** (e.g., `number_small`, `number_big`)
+- Sized integer types in public API: `int32_t`, `uint32_t`
+- Declare structs as `struct foo {}` not `typedef struct foo {} foo`
+- In C++ omit `struct`/`enum` keyword when unnecessary
+- Avoid templates, fancy STL constructs - use basic `for` loops
+- Keep it simple, minimal dependencies
 
-- Writing PR descriptions, commit messages, or responses to reviewers
-- Committing or pushing without explicit human approval for each action
-- Implementing features the contributor does not understand
-- Generating changes too extensive for the contributor to fully review
+**Formatting:** Use `.clang-format` (clang-tools v15+) when in doubt. The project has a comprehensive `.clang-format` config at the root.
 
-When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
+**EditorConfig:** Root `.editorconfig` enforces: spaces, indent 4, LF, UTF-8, trailing whitespace trimmed.
 
-### Useful Resources
+**Pre-commit hooks:** trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, flake8.
 
-To conserve context space, load these resources as needed:
+---
 
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
+## Module Naming Conventions
+
+| Prefix | Purpose | Examples |
+|--------|---------|----------|
+| `llama-*` | Core llama modules | `llama-model`, `llama-context`, `llama-sampler` |
+| `ggml-*` | ggml backend modules | `ggml-cpu`, `ggml-cuda`, `ggml-metal`, `ggml-vulkan` |
+| `test-*` | Test files | `test-backend-ops`, `test-tokenizer-0`, `test-sampling` |
+
+Source files follow the pattern: `src/llama-{module}.cpp` / `src/llama-{module}.h`
+
+---
+
+## Testing
+
+**Before Committing:**
+
+```bash
+# Build with tests enabled (default for standalone builds)
+cmake -B build -DLLAMA_BUILD_TESTS=ON
+cmake --build build -j$(nproc)
+
+# Run all tests
+cd build && ctest --output-on-failure
+
+# Run specific test binary directly
+./build/bin/test-backend-ops
+./build/bin/test-sampling
+./build/bin/test-tokenizer-0
+
+# Run CI locally (comprehensive)
+./ci/run.sh
+
+# Performance regression check
+./build/bin/llama-bench
+./build/bin/llama-perplexity
+```
+
+**Key Test Binaries:**
+
+| Test | Purpose |
+|------|---------|
+| `test-backend-ops` | Verify ggml operator consistency across backends |
+| `test-sampling` | Token sampling correctness |
+| `test-tokenizer-0` | Tokenizer roundtrip tests |
+| `test-chat-template` | Chat template rendering |
+| `test-grammar-parser` | GBNF grammar parsing |
+| `test-quantize-fns` | Quantization function correctness |
+| `test-chat.cpp` | End-to-end chat tests |
+
+**Python Tests:**
+
+```bash
+# GGUF Python library tests
+cd gguf-py && python -m pytest tests/
+
+# Tokenizer tests
+python tests/test-tokenizer-0.py
+```
+
+---
+
+## Commit Format
+
+Project maintainers squash-merge PRs with format:
+
+```
+<module> : <commit title> (#<issue_number>)
+```
+
+**Example:** `utils : fix typo in utils.py (#1234)`
+
+Modules listed at: https://github.com/ggml-org/llama.cpp/wiki/Modules
+
+---
+
+## Development Tools
+
+**Common Commands:**
+
+```bash
+# Quick rebuild (after initial cmake)
+cmake --build build -j$(nproc)
+
+# Debug build
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+
+# Address sanitizer
+cmake -B build -DLLAMA_SANITIZE_ADDRESS=ON
+cmake --build build
+
+# Run the server with a model
+./build/bin/llama-server -m model.gguf --port 8080
+
+# CLI inference
+./build/bin/llama-cli -m model.gguf -p "Hello, world"
+
+# Quantize a model
+./build/bin/llama-quantize input.gguf output.gguf Q4_K_M
+
+# Convert HuggingFace model
+python convert_hf_to_gguf.py /path/to/model --outfile output.gguf
+
+# Benchmark
+./build/bin/llama-bench -m model.gguf
+
+# Check GGUF file info
+python -m gguf.scripts.gguf_dump model.gguf
+```
+
+---
+
+## Common Patterns
+
+**Matrix Multiplication Convention:**
+
+`C = ggml_mul_mat(ctx, A, B)` means C^T = A * B^T, i.e. C = B * A^T. This is **unconventional** - always keep it in mind when working with tensor operations.
+
+**Tensor Dimensions:**
+
+Tensors store data in row-major order. Dimension 0 = columns, 1 = rows, 2 = matrices.
+
+**Adding a New Model:**
+
+See `docs/development/HOWTO-add-model.md` for the full guide. Key files:
+- `src/llama-model.cpp` - Model forward pass
+- `src/llama-arch.cpp` / `src/llama-arch.h` - Architecture definitions
+- `src/llama-hparams.cpp` / `src/llama-hparams.h` - Hyperparameters
+- `convert_hf_to_gguf.py` - Model conversion
+
+**Chat Template Parsing:**
+
+llama.cpp uses a custom PEG parser (not regex) for parsing model output. See `docs/development/parsing.md` and `docs/autoparser.md`.
+
+**Server API:**
+
+The server (`tools/server/`) is OpenAI-compatible. See `tools/server/README.md` (usage) and `tools/server/README-dev.md` (development).
+
+---
+
+## Documentation
+
+### What Needs Documentation
+
+| Change Type | Required Documentation |
+|-------------|------------------------|
+| New model architecture | `docs/development/HOWTO-add-model.md`, `src/` headers |
+| New ggml operator | `docs/ops.md`, test cases in `test-backend-ops` |
+| Server API change | `tools/server/README.md` |
+| Build system change | `docs/build.md` |
+| New quantization type | Perplexity data, KL divergence, performance benchmarks |
+| Python API change | `gguf-py/` docstrings |
+| New tool | `README.md` in tool directory |
+
+### Key Documentation Files
+
+- `docs/build.md` - Build instructions for all platforms/backends
+- `docs/development/HOWTO-add-model.md` - Adding new model support
+- `docs/development/parsing.md` - PEG parser for model output
+- `docs/autoparser.md` - Auto-detecting model features
+- `docs/ops.md` - ggml operator reference
+- `tools/server/README.md` - Server usage
+- `tools/server/README-dev.md` - Server development guide
+- `CONTRIBUTING.md` - Contribution guidelines and coding standards
+- `common/jinja/README.md` - Jinja template engine
+
+---
+
+## Anti-Patterns (What NOT To Do)
+
+| Anti-Pattern | Why It's Wrong | What To Do |
+|--------------|----------------|------------|
+| Adding third-party dependencies | Project minimizes deps intentionally | Use vendored libs in `vendor/` or implement inline |
+| Using `typedef struct foo {} foo` | Project convention is `struct foo {}` | Declare as `struct foo {}` |
+| Fancy template metaprogramming | Codebase avoids complex STL constructs | Use basic loops and simple patterns |
+| Mixing unrelated changes in one PR | Maintainers require separate PRs per feature | Create one PR per feature or fix |
+| Adding new model with GPU support initially | Too much review scope | CPU-only first, GPU backends in follow-ups |
+| Using regex for output parsing | Project uses PEG parser | Use `common/chat-peg-parser.h` |
+| Ignoring clang-format | Project has strict formatting rules | Run clang-format, respect `.editorconfig` |
+| AI-generated PR descriptions | Will result in immediate PR closure | Write descriptions yourself |
+| Committing handoff files | Session notes are internal | Keep `ai-assisted/` out of git |
+
+---
+
+## Quick Reference
+
+```bash
+# Build
+cmake -B build && cmake --build build -j$(nproc)
+
+# Test
+cd build && ctest --output-on-failure
+
+# Server
+./build/bin/llama-server -m model.gguf
+
+# CLI
+./build/bin/llama-cli -m model.gguf
+
+# Quantize
+./build/bin/llama-quantize input.gguf output.gguf Q4_K_M
+
+# Convert
+python convert_hf_to_gguf.py /path/to/hf-model
+
+# CI locally
+./ci/run.sh
+
+# Format check
+git diff --name-only | grep -E '\.(c|cpp|h|hpp)$' | xargs clang-format --dry-run -Werror
+
+# Search code
+grep -rn "pattern" src/ common/ include/
+```
+
+---
+
+*For project methodology and workflow, see .clio/instructions.md*
